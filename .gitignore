@@ -1,0 +1,7 @@
+.claude/
+.idea/
+node_modules/
+qdrant_data/
+qdrant_storage/
+pnpm-lock.yaml
+*.iml

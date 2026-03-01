@@ -1,0 +1,28 @@
+services:
+  # The Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: memory-db
+    ports:
+      - "6333:6333" # Access Dashboard at http://localhost:6333/dashboard
+    volumes:
+      - ./qdrant_storage:/qdrant/storage:z
+    restart: unless-stopped
+
+  # Your Memory MCP Server
+  mcp-server:
+    build: .
+    container_name: context-memory-mcp-server
+    # These flags allow Stdio communication
+    stdin_open: true
+    tty: true
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      # Fallback Project ID if auto-detection fails
+      - PROJECT_ROOT=/app
+      - SHARP_IGNORE_GLOBAL_LIBVIPS=1
+    depends_on:
+      - qdrant
+    # Mount the current project so get_current_project_id works
+    #volumes:
+    # - .:/app:ro

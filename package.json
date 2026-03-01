@@ -1,0 +1,36 @@
+{
+  "name": "context-memory",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "An implementation of a context memory system using Qdrant as the vector database and the Model Context Protocol for integration with language models.",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.11.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@qdrant/js-client-rest": "^1.17.0",
+    "@xenova/transformers": "^2.17.2",
+    "uuid": "^13.0.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "@types/uuid": "^11.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  },
+  "pnpm": {
+    "overrides": {
+      "sharp": "npm:empty-npm-package@1.0.0"
+    }
+  }
+}
