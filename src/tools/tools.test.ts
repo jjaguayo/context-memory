@@ -7,8 +7,11 @@ vi.mock('../lib/qdrant.js', () => ({
     search: vi.fn().mockResolvedValue([]),
     delete: vi.fn().mockResolvedValue({}),
     scroll: vi.fn().mockResolvedValue({points: []}),
+    retrieve: vi.fn().mockResolvedValue([]),
   },
+  sharedQdrant: null,
   ensureCollection: vi.fn().mockResolvedValue(undefined),
+  ensureSharedCollection: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../lib/embeddings.js', () => ({
@@ -22,7 +25,22 @@ import {registerSearchTool} from './search.js';
 import {registerForgetTool} from './forget.js';
 import {registerGetCurrent} from './get_current.js';
 import {registerListProjectsTool} from './list_projects.js';
+import {registerPromoteTool} from './promote.js';
 import type {MemoryProfile} from '../lib/profile.js';
+
+// ---------------------------------------------------------------------------
+// Reusable mock shared Qdrant client
+// ---------------------------------------------------------------------------
+
+function makeMockSharedQdrant() {
+  return {
+    upsert: vi.fn().mockResolvedValue({}),
+    search: vi.fn().mockResolvedValue([]),
+    delete: vi.fn().mockResolvedValue({}),
+    scroll: vi.fn().mockResolvedValue({points: []}),
+    retrieve: vi.fn().mockResolvedValue([]),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Minimal server stub — captures registered tool handlers so we can call them
@@ -432,5 +450,416 @@ describe('list_projects', () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toMatch(/scroll failed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// promote_memory
+// ---------------------------------------------------------------------------
+
+describe('promote_memory', () => {
+  it('returns isError when shared layer is not configured', async () => {
+    const server = new MockServer();
+    registerPromoteTool(server as any, null);
+
+    const result = await server.call('promote_memory', {memoryId: 'abc-123'});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/QDRANT_SHARED_URL/);
+    expect(vi.mocked(qdrant.retrieve)).not.toHaveBeenCalled();
+  });
+
+  it('returns isError when memory not found in personal layer', async () => {
+    vi.mocked(qdrant.retrieve).mockResolvedValueOnce([]);
+    const mockShared = makeMockSharedQdrant();
+    const server = new MockServer();
+    registerPromoteTool(server as any, mockShared as any);
+
+    const result = await server.call('promote_memory', {memoryId: 'abc-123'});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/not found in personal layer/);
+    expect(mockShared.upsert).not.toHaveBeenCalled();
+  });
+
+  it('copies memory to shared layer with a new UUID', async () => {
+    const personalId = 'personal-uuid-123';
+    vi.mocked(qdrant.retrieve).mockResolvedValueOnce([{
+      id: personalId,
+      vector: new Array(384).fill(0.1),
+      payload: {text: 'Auth uses RS256', projectId: 'my-project', tags: ['auth'], scope: 'personal'},
+    }] as any);
+    const mockShared = makeMockSharedQdrant();
+    const server = new MockServer();
+    registerPromoteTool(server as any, mockShared as any);
+
+    const result = await server.call('promote_memory', {memoryId: personalId});
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toMatch(/promoted to shared layer/);
+    expect(result.content[0]!.text).toMatch(/my-project/);
+
+    const upsertCall = mockShared.upsert.mock.calls[0]!;
+    const point = (upsertCall[1] as any).points[0];
+    // Must use a NEW UUID — not the personal ID
+    expect(point.id).not.toBe(personalId);
+    expect(point.id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('sets scope to "shared" in the promoted payload', async () => {
+    vi.mocked(qdrant.retrieve).mockResolvedValueOnce([{
+      id: 'abc-123',
+      vector: new Array(384).fill(0.1),
+      payload: {text: 'x', projectId: 'p', scope: 'personal'},
+    }] as any);
+    const mockShared = makeMockSharedQdrant();
+    const server = new MockServer();
+    registerPromoteTool(server as any, mockShared as any);
+
+    await server.call('promote_memory', {memoryId: 'abc-123'});
+
+    const point = (mockShared.upsert.mock.calls[0]![1] as any).points[0];
+    expect(point.payload.scope).toBe('shared');
+  });
+
+  it('does not delete the personal copy after promotion', async () => {
+    vi.mocked(qdrant.retrieve).mockResolvedValueOnce([{
+      id: 'abc-123',
+      vector: new Array(384).fill(0.1),
+      payload: {text: 'x', projectId: 'p'},
+    }] as any);
+    const mockShared = makeMockSharedQdrant();
+    const server = new MockServer();
+    registerPromoteTool(server as any, mockShared as any);
+
+    await server.call('promote_memory', {memoryId: 'abc-123'});
+
+    expect(vi.mocked(qdrant.delete)).not.toHaveBeenCalled();
+  });
+
+  it('returns isError when shared upsert throws', async () => {
+    vi.mocked(qdrant.retrieve).mockResolvedValueOnce([{
+      id: 'abc-123',
+      vector: new Array(384).fill(0.1),
+      payload: {text: 'x', projectId: 'p'},
+    }] as any);
+    const mockShared = makeMockSharedQdrant();
+    mockShared.upsert.mockRejectedValueOnce(new Error('shared write failed'));
+    const server = new MockServer();
+    registerPromoteTool(server as any, mockShared as any);
+
+    const result = await server.call('promote_memory', {memoryId: 'abc-123'});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/shared write failed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// search_memories — shared layer behaviour
+// ---------------------------------------------------------------------------
+
+describe('search_memories (shared layer)', () => {
+  it('queries both layers when sharedQdrant is provided', async () => {
+    const mockShared = makeMockSharedQdrant();
+    vi.mocked(qdrant.search).mockResolvedValueOnce([]);
+    const server = new MockServer();
+    registerSearchTool(server as any, mockShared as any);
+
+    await server.call('search_memories', {query: 'q', limit: 5});
+
+    expect(vi.mocked(qdrant.search)).toHaveBeenCalledOnce();
+    expect(mockShared.search).toHaveBeenCalledOnce();
+  });
+
+  it('merges and sorts results by score descending with source labels', async () => {
+    const mockShared = makeMockSharedQdrant();
+    vi.mocked(qdrant.search).mockResolvedValueOnce([
+      {id: 'p1', score: 0.9, payload: {projectId: 'proj', text: 'Personal high'}},
+      {id: 'p2', score: 0.5, payload: {projectId: 'proj', text: 'Personal low'}},
+    ] as any);
+    mockShared.search.mockResolvedValueOnce([
+      {id: 's1', score: 0.85, payload: {projectId: 'proj', text: 'Shared mid'}},
+    ] as any);
+
+    const server = new MockServer();
+    registerSearchTool(server as any, mockShared as any);
+
+    const result = await server.call('search_memories', {query: 'q', limit: 5});
+    const text = result.content[0]!.text;
+
+    // Correct order: p1(0.9), s1(0.85), p2(0.5)
+    const p1Pos = text.indexOf('Personal high');
+    const s1Pos = text.indexOf('Shared mid');
+    const p2Pos = text.indexOf('Personal low');
+    expect(p1Pos).toBeLessThan(s1Pos);
+    expect(s1Pos).toBeLessThan(p2Pos);
+
+    // Labels present
+    expect(text).toMatch(/\[personal\]/);
+    expect(text).toMatch(/\[shared\]/);
+  });
+
+  it('applies limit to merged results, not per layer', async () => {
+    const mockShared = makeMockSharedQdrant();
+    vi.mocked(qdrant.search).mockResolvedValueOnce([
+      {id: 'p1', score: 0.9, payload: {projectId: 'proj', text: 'top-personal'}},
+      {id: 'p2', score: 0.8, payload: {projectId: 'proj', text: 'low-personal'}},
+    ] as any);
+    mockShared.search.mockResolvedValueOnce([
+      {id: 's1', score: 0.85, payload: {projectId: 'proj', text: 'top-shared'}},
+      {id: 's2', score: 0.7, payload: {projectId: 'proj', text: 'low-shared'}},
+    ] as any);
+
+    const server = new MockServer();
+    registerSearchTool(server as any, mockShared as any);
+
+    const result = await server.call('search_memories', {query: 'q', limit: 2});
+    const text = result.content[0]!.text;
+
+    // Only top 2 results: p1(0.9) and s1(0.85)
+    expect(text).toContain('top-personal');
+    expect(text).toContain('top-shared');
+    expect(text).not.toContain('low-personal');
+    expect(text).not.toContain('low-shared');
+  });
+
+  it('falls back to personal results when shared layer throws', async () => {
+    const mockShared = makeMockSharedQdrant();
+    vi.mocked(qdrant.search).mockResolvedValueOnce([
+      {id: 'p1', score: 0.9, payload: {projectId: 'proj', text: 'Personal result'}},
+    ] as any);
+    mockShared.search.mockRejectedValueOnce(new Error('shared down'));
+
+    const server = new MockServer();
+    registerSearchTool(server as any, mockShared as any);
+
+    const result = await server.call('search_memories', {query: 'q', limit: 5});
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toContain('Personal result');
+  });
+
+  it('omits source labels when no shared layer is configured', async () => {
+    vi.mocked(qdrant.search).mockResolvedValueOnce([
+      {id: 'p1', score: 0.9, payload: {projectId: 'proj', text: 'Only personal'}},
+    ] as any);
+    const server = new MockServer();
+    registerSearchTool(server as any); // no sharedQdrant
+
+    const result = await server.call('search_memories', {query: 'q', limit: 5});
+
+    expect(result.content[0]!.text).not.toMatch(/\[personal\]/);
+    expect(result.content[0]!.text).not.toMatch(/\[shared\]/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// forget_memory — scope parameter
+// ---------------------------------------------------------------------------
+
+describe('forget_memory (scope)', () => {
+  it('deletes from personal only when scope is "personal" (default)', async () => {
+    const mockShared = makeMockSharedQdrant();
+    const server = new MockServer();
+    registerForgetTool(server as any, mockShared as any);
+
+    await server.call('forget_memory', {memoryId: 'abc', scope: 'personal'});
+
+    expect(vi.mocked(qdrant.delete)).toHaveBeenCalledOnce();
+    expect(mockShared.delete).not.toHaveBeenCalled();
+  });
+
+  it('deletes from shared only when scope is "shared"', async () => {
+    const mockShared = makeMockSharedQdrant();
+    const server = new MockServer();
+    registerForgetTool(server as any, mockShared as any);
+
+    const result = await server.call('forget_memory', {memoryId: 'abc', scope: 'shared'});
+
+    expect(result.isError).toBeUndefined();
+    expect(vi.mocked(qdrant.delete)).not.toHaveBeenCalled();
+    expect(mockShared.delete).toHaveBeenCalledOnce();
+  });
+
+  it('deletes from both layers when scope is "all"', async () => {
+    const mockShared = makeMockSharedQdrant();
+    const server = new MockServer();
+    registerForgetTool(server as any, mockShared as any);
+
+    const result = await server.call('forget_memory', {memoryId: 'abc', scope: 'all'});
+
+    expect(result.isError).toBeUndefined();
+    expect(vi.mocked(qdrant.delete)).toHaveBeenCalledOnce();
+    expect(mockShared.delete).toHaveBeenCalledOnce();
+    expect(result.content[0]!.text).toMatch(/both layers/);
+  });
+
+  it('returns isError for scope "shared" when shared layer not configured', async () => {
+    const server = new MockServer();
+    registerForgetTool(server as any, null);
+
+    const result = await server.call('forget_memory', {memoryId: 'abc', scope: 'shared'});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/QDRANT_SHARED_URL/);
+  });
+
+  it('partial success message when scope "all" and shared delete fails', async () => {
+    const mockShared = makeMockSharedQdrant();
+    mockShared.delete.mockRejectedValueOnce(new Error('shared unavailable'));
+    const server = new MockServer();
+    registerForgetTool(server as any, mockShared as any);
+
+    const result = await server.call('forget_memory', {memoryId: 'abc', scope: 'all'});
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toMatch(/personal layer/);
+    expect(result.content[0]!.text).toMatch(/shared unavailable/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// remember_info — scope in payload and auto-promote
+// ---------------------------------------------------------------------------
+
+describe('remember_info (scope & auto-promote)', () => {
+  it('stores scope "personal" in the Qdrant payload', async () => {
+    const server = new MockServer();
+    registerRememberTool(server as any);
+
+    await server.call('remember_info', {text: 'x', projectId: 'p'});
+
+    const payload = (vi.mocked(qdrant.upsert).mock.calls[0]![1] as any).points[0].payload;
+    expect(payload.scope).toBe('personal');
+  });
+
+  it('auto-promotes when tag matches auto_promote_tags and shared layer is configured', async () => {
+    const profile: MemoryProfile = {
+      version: 1, name: 'test', required_tags: [], memory_categories: [],
+      auto_promote_tags: ['architecture'],
+    };
+    const mockShared = makeMockSharedQdrant();
+    const server = new MockServer();
+    registerRememberTool(server as any, profile, mockShared as any);
+
+    const result = await server.call('remember_info', {
+      text: 'We use event sourcing', projectId: 'p', tags: ['architecture', 'backend'],
+    });
+
+    expect(vi.mocked(qdrant.upsert)).toHaveBeenCalledOnce();   // personal write
+    expect(mockShared.upsert).toHaveBeenCalledOnce();          // auto-promote
+    expect(result.content[0]!.text).toMatch(/auto-promoted to shared/);
+    expect(result.content[0]!.text).toMatch(/architecture/);
+
+    const sharedPayload = (mockShared.upsert.mock.calls[0]![1] as any).points[0].payload;
+    expect(sharedPayload.scope).toBe('shared');
+  });
+
+  it('does not auto-promote when no tags match auto_promote_tags', async () => {
+    const profile: MemoryProfile = {
+      version: 1, name: 'test', required_tags: [], memory_categories: [],
+      auto_promote_tags: ['architecture'],
+    };
+    const mockShared = makeMockSharedQdrant();
+    const server = new MockServer();
+    registerRememberTool(server as any, profile, mockShared as any);
+
+    await server.call('remember_info', {text: 'x', projectId: 'p', tags: ['payments']});
+
+    expect(mockShared.upsert).not.toHaveBeenCalled();
+  });
+
+  it('succeeds with personal-only write when shared layer not configured but tag matches', async () => {
+    const profile: MemoryProfile = {
+      version: 1, name: 'test', required_tags: [], memory_categories: [],
+      auto_promote_tags: ['architecture'],
+    };
+    const server = new MockServer();
+    registerRememberTool(server as any, profile, null); // no shared
+
+    const result = await server.call('remember_info', {
+      text: 'x', projectId: 'p', tags: ['architecture'],
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(vi.mocked(qdrant.upsert)).toHaveBeenCalledOnce();
+  });
+
+  it('still succeeds with personal write when auto-promote fails', async () => {
+    const profile: MemoryProfile = {
+      version: 1, name: 'test', required_tags: [], memory_categories: [],
+      auto_promote_tags: ['architecture'],
+    };
+    const mockShared = makeMockSharedQdrant();
+    mockShared.upsert.mockRejectedValueOnce(new Error('shared down'));
+    const server = new MockServer();
+    registerRememberTool(server as any, profile, mockShared as any);
+
+    const result = await server.call('remember_info', {
+      text: 'x', projectId: 'p', tags: ['architecture'],
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(vi.mocked(qdrant.upsert)).toHaveBeenCalledOnce();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// list_projects — shared layer
+// ---------------------------------------------------------------------------
+
+describe('list_projects (shared layer)', () => {
+  it('merges projects from both layers and deduplicates', async () => {
+    const mockShared = makeMockSharedQdrant();
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [{id: '1', payload: {projectId: 'personal-only'}}],
+    } as any);
+    mockShared.scroll.mockResolvedValueOnce({
+      points: [
+        {id: '2', payload: {projectId: 'shared-only'}},
+        {id: '3', payload: {projectId: 'personal-only'}}, // duplicate
+      ],
+    } as any);
+
+    const server = new MockServer();
+    registerListProjectsTool(server as any, mockShared as any);
+
+    const result = await server.call('list_projects');
+    const text = result.content[0]!.text;
+
+    expect(text).toContain('personal-only');
+    expect(text).toContain('shared-only');
+    // Should appear only once
+    expect(text.split('personal-only').length - 1).toBe(1);
+  });
+
+  it('returns projects from shared even when personal has none', async () => {
+    const mockShared = makeMockSharedQdrant();
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({points: []} as any);
+    mockShared.scroll.mockResolvedValueOnce({
+      points: [{id: '1', payload: {projectId: 'team-project'}}],
+    } as any);
+
+    const server = new MockServer();
+    registerListProjectsTool(server as any, mockShared as any);
+
+    const result = await server.call('list_projects');
+    expect(result.content[0]!.text).toContain('team-project');
+  });
+
+  it('degrades gracefully when shared layer is unreachable', async () => {
+    const mockShared = makeMockSharedQdrant();
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [{id: '1', payload: {projectId: 'personal-only'}}],
+    } as any);
+    mockShared.scroll.mockRejectedValueOnce(new Error('shared down'));
+
+    const server = new MockServer();
+    registerListProjectsTool(server as any, mockShared as any);
+
+    const result = await server.call('list_projects');
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toContain('personal-only');
   });
 });

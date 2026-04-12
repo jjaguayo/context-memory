@@ -2,6 +2,8 @@
 
 An MCP (Model Context Protocol) server that gives AI agents persistent semantic memory across sessions. It stores, searches, and manages information using a local Qdrant vector database and WASM-based text embeddings — no external APIs required.
 
+Teams can optionally deploy a shared Qdrant instance so every developer's AI agent draws from the same pool of architectural decisions, API contracts, and known gotchas.
+
 ## How It Works
 
 When an AI agent calls `remember_info`, the text is converted into a 384-dimensional vector using the `all-MiniLM-L6-v2` model (runs locally via WASM) and stored in Qdrant. When the agent calls `search_memories`, the query is embedded the same way and a cosine similarity search finds the most relevant stored memories — even if the phrasing differs.
@@ -15,7 +17,7 @@ When an AI agent calls `remember_info`, the text is converted into a 384-dimensi
 ## Build
 
 ```bash
-# Install dependencies
+# Install dependencies (also installs the pre-push git hook)
 pnpm install
 
 # Compile TypeScript → dist/
@@ -26,27 +28,38 @@ pnpm run build
 
 ### Recommended: Docker Compose
 
-Starts both the Qdrant vector database and the MCP server together:
+Starts the MCP server alongside both a personal and a shared Qdrant instance:
 
 ```bash
 docker-compose up
 ```
 
-Qdrant data is persisted in `./qdrant_storage/`. The Qdrant dashboard is available at `http://localhost:6333/dashboard`.
+| Service | Port | Purpose |
+|---|---|---|
+| `qdrant` | 6333 | Personal vector database. Dashboard: http://localhost:6333/dashboard |
+| `qdrant-shared` | 6334 | Shared vector database (team layer). Dashboard: http://localhost:6334/dashboard |
+| `mcp-server` | — | MCP server connected to both Qdrant instances |
+
+Data is persisted in `./qdrant_storage/` (personal) and `./qdrant_storage_shared/` (shared).
 
 ### Local (without Docker)
 
-You must have a Qdrant instance running separately. Then:
+Start Qdrant separately, then run the server with the relevant environment variables:
 
 ```bash
+# Personal only
 QDRANT_URL=http://localhost:6333 pnpm run start
+
+# Personal + shared layer
+QDRANT_URL=http://localhost:6333 QDRANT_SHARED_URL=http://localhost:6334 pnpm run start
 ```
 
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `QDRANT_URL` | `http://localhost:6333` | URL of the Qdrant instance |
+| `QDRANT_URL` | `http://localhost:6333` | Personal Qdrant instance URL |
+| `QDRANT_SHARED_URL` | _(unset)_ | Shared Qdrant instance URL. When set, enables the team memory layer. |
 | `PROJECT_ROOT` | Current working directory | Used to derive the default project ID and locate the team memory profile |
 
 ## Connecting to Claude Code
@@ -56,16 +69,16 @@ Add the server to your Claude Code MCP configuration via `claude mcp add`:
 ```bash
 claude mcp add-json docker-memory '{
   "command": "docker",
-  "args": ["exec", "-i", "-e", "PROJECT_ROOT='$(pwd)'", "context-memory-mcp-server", "node", "dist/index.js"]
+  "args": ["exec", "-i", "-e", "PROJECT_ROOT=$(pwd)", "context-memory-mcp-server", "node", "dist/index.js"]
 }'
 ```
 
 Also consider adding instructions for how to use the tools in your agent's system prompt, referencing the tool names and expected inputs/outputs.
-The CLAUDE.md file in this repo provides an example of how to do this.
+The `CLAUDE.md` file in this repo provides an example of how to do this.
 
 ## MCP Tools
 
-Once connected, the AI agent has access to five tools:
+Once connected, the AI agent has access to six tools:
 
 ### `get_current_project_id`
 Returns the current project identifier derived from `$PROJECT_ROOT` or the working directory name. Call this at the start of a session to scope memories to the right project.
@@ -78,6 +91,8 @@ get_current_project_id()
 ### `remember_info`
 Stores a piece of text with optional tags and category, scoped to a project. When a [team memory profile](#team-memory-profiles) is active, required tags and allowed categories are enforced.
 
+If the stored memory's tags match `auto_promote_tags` in the active profile and a shared layer is configured, the memory is automatically promoted to the shared layer.
+
 ```
 remember_info({
   text: "The payment service uses idempotency keys to prevent duplicate charges.",
@@ -88,7 +103,7 @@ remember_info({
 ```
 
 ### `search_memories`
-Performs a semantic similarity search across stored memories. Finds relevant results even when phrasing differs from the original.
+Performs a semantic similarity search across stored memories. When a shared layer is configured, results from both layers are merged and ranked by relevance. Each result is labelled with its source.
 
 ```
 search_memories({
@@ -96,22 +111,39 @@ search_memories({
   projectId: "my-project",
   limit: 5
 })
-→ [ID: abc-123] The payment service uses idempotency keys to prevent duplicate charges.
+→ [ID: abc-123] [personal] [Project: my-project] The payment service uses idempotency keys...
+→ [ID: def-456] [shared]   [Project: my-project] Billing retries are capped at 3 attempts...
 ```
+
+If the shared layer is unreachable, personal results are returned without error.
+
+### `promote_memory`
+Copies a personal memory to the shared layer so teammates can find it. The personal copy is kept.
+
+```
+promote_memory({ memoryId: "abc-123" })
+→ "✅ Memory abc-123 promoted to shared layer (shared ID: xyz-789) for project \"my-project\"."
+```
+
+Requires `QDRANT_SHARED_URL` to be configured.
 
 ### `forget_memory`
-Deletes a single memory by ID, or all memories for a project.
+Deletes a single memory by ID, or all memories for a project. Use the optional `scope` parameter to target a specific layer.
 
 ```
-# Delete one memory
+# Delete from personal layer (default)
 forget_memory({ memoryId: "abc-123" })
+forget_memory({ memoryId: "abc-123", scope: "personal" })
 
-# Wipe all memories for a project
-forget_memory({ projectId: "my-project" })
+# Delete from shared layer
+forget_memory({ memoryId: "xyz-789", scope: "shared" })
+
+# Delete from both layers
+forget_memory({ projectId: "my-project", scope: "all" })
 ```
 
 ### `list_projects`
-Lists all projects that have at least one stored memory.
+Lists all projects that have at least one stored memory. Queries both personal and shared layers and returns the deduplicated union.
 
 ```
 list_projects()
@@ -145,6 +177,12 @@ memory_categories:
   - Known Gotchas
   - Coding Preferences
 
+# Memories tagged with any of these are automatically promoted to shared
+# when a shared layer is configured.
+auto_promote_tags:
+  - architecture
+  - api-contract
+
 # Retention hints (not enforced yet — reserved for a future release).
 retention:
   default_days: 90
@@ -169,11 +207,39 @@ When the server starts, it looks for `.context-memory/profile.yml` relative to `
   Invalid category 'Misc'. Allowed categories: [Architecture Decisions, API Contracts, Known Gotchas, Coding Preferences]. Profile: acme-eng-standard v1
   ```
 
+- **Auto-promotion** — if a memory's tags intersect `auto_promote_tags` and `QDRANT_SHARED_URL` is configured, the memory is automatically promoted:
+  ```
+  ✅ Remembered for project "my-project" and auto-promoted to shared (tag: architecture): ...
+  ```
+
 - **Category is always optional** — omitting `category` is valid even when `memory_categories` is defined.
 
 ### Backward Compatibility
 
-Projects without a `.context-memory/profile.yml` file behave exactly as before — there is no change in behavior and no configuration required for existing setups.
+Projects without a `.context-memory/profile.yml` file behave exactly as before. Projects without `QDRANT_SHARED_URL` set see no change from the shared layer features.
+
+---
+
+## Team Setup
+
+### Solo Developer
+No additional configuration needed. Run as normal — everything uses the personal Qdrant instance.
+
+### Connecting a Team to a Shared Layer
+
+1. **Deploy a shared Qdrant instance** on your team's infrastructure (or use the local `docker-compose` setup for testing):
+   ```bash
+   docker-compose up qdrant-shared
+   ```
+
+2. **Each team member sets `QDRANT_SHARED_URL`** pointing to the shared instance in their MCP server configuration.
+
+3. **Team members can now:**
+   - Search shared memories automatically via `search_memories`
+   - Promote personal memories to shared via `promote_memory`
+   - Define `auto_promote_tags` in `profile.yml` for automatic promotion
+
+4. **New team members** — configure `QDRANT_SHARED_URL` and immediately inherit the team's shared knowledge base.
 
 ---
 
@@ -190,6 +256,8 @@ pnpm test
 pnpm test:watch
 ```
 
+The pre-push git hook (installed by `pnpm install` via the `prepare` script) runs the full test suite before any push to `main`.
+
 ## Vector Database Schema
 
 ```
@@ -202,6 +270,7 @@ Payload fields:
   projectId : string        — project scope (indexed)
   tags      : string[]      — keywords for categorization
   timestamp : ISO 8601      — when the memory was created
+  scope     : "personal" | "shared"  — which layer this memory lives in
   category  : string?       — optional memory category (validated against profile if active)
 ```
 

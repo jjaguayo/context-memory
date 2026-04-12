@@ -2,10 +2,9 @@ import {McpServer} from "@modelcontextprotocol/sdk/server/mcp.js";
 import {z} from "zod";
 import {qdrant} from "../lib/qdrant.js";
 import {getLocalEmbedding} from "../lib/embeddings.js";
-// 1. Import the Filter type
-import type {Schemas} from "@qdrant/js-client-rest";
+import type {Schemas, QdrantClient} from "@qdrant/js-client-rest";
 
-export function registerSearchTool(server: McpServer) {
+export function registerSearchTool(server: McpServer, sharedQdrant: QdrantClient | null = null) {
   server.tool(
     "search_memories",
     {
@@ -16,17 +15,10 @@ export function registerSearchTool(server: McpServer) {
     async ({query, projectId, limit}) => {
       const vector = await getLocalEmbedding(query);
 
-      // 2. Explicitly define the filter type
       let filter: Schemas["Filter"] | undefined = undefined;
-
       if (projectId) {
         filter = {
-          must: [
-            {
-              key: "projectId",
-              match: {value: projectId}
-            }
-          ]
+          must: [{key: "projectId", match: {value: projectId}}]
         };
       }
 
@@ -37,11 +29,31 @@ export function registerSearchTool(server: McpServer) {
         ...(filter && {filter})
       };
 
-      const results = await qdrant.search("memories", searchParams);
+      // Query both layers in parallel; shared layer failure degrades silently
+      const [personalResults, sharedResults] = await Promise.all([
+        qdrant.search("memories", searchParams),
+        sharedQdrant
+          ? sharedQdrant.search("memories", searchParams).catch((err: Error) => {
+              console.error(`[shared] Unreachable — returning personal results only: ${err.message}`);
+              return [];
+            })
+          : Promise.resolve([]),
+      ]);
 
-      // Inside search_memories tool mapping
-      const formatted = results
-        .map(res => `[ID: ${res.id}] [Project: ${res.payload?.projectId}] ${res.payload?.text}`)
+      // Merge and sort by score descending, apply limit to merged list
+      type LayeredResult = (typeof personalResults)[number] & {_layer: "personal" | "shared"};
+      const merged: LayeredResult[] = [
+        ...personalResults.map(r => ({...r, _layer: "personal" as const})),
+        ...sharedResults.map(r => ({...r, _layer: "shared" as const})),
+      ]
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+
+      const formatted = merged
+        .map(res => {
+          const layerLabel = sharedQdrant ? ` [${res._layer}]` : "";
+          return `[ID: ${res.id}]${layerLabel} [Project: ${res.payload?.projectId}] ${res.payload?.text}`;
+        })
         .join("\n---\n");
 
       return {

@@ -1,6 +1,6 @@
 # Requirements: Team Memory Profiles ("Memory Standards")
 
-> **Status:** Draft — pending review  
+> **Status:** Implemented  
 > **Authors:** Technical PM + Principal Engineer  
 > **Date:** 2026-04-12  
 > **Idea reference:** `PRODUCT_IDEAS.md` — Idea 1  

@@ -1,28 +1,40 @@
 services:
-  # The Vector Database
+  # Personal vector database (local to each developer)
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: memory-db
+    container_name: memory-db-personal
     ports:
-      - "6333:6333" # Access Dashboard at http://localhost:6333/dashboard
+      - "6333:6333" # Dashboard: http://localhost:6333/dashboard
     volumes:
       - ./qdrant_storage:/qdrant/storage:z
     restart: unless-stopped
 
-  # Your Memory MCP Server
+  # Shared vector database (simulates team-deployed instance for local dev)
+  # In production, point QDRANT_SHARED_URL at your actual shared Qdrant instance instead.
+  qdrant-shared:
+    image: qdrant/qdrant:latest
+    container_name: memory-db-shared
+    ports:
+      - "6334:6333" # Dashboard: http://localhost:6334/dashboard
+    volumes:
+      - ./qdrant_storage_shared:/qdrant/storage:z
+    restart: unless-stopped
+
+  # Memory MCP Server
   mcp-server:
     build: .
     container_name: context-memory-mcp-server
-    # These flags allow Stdio communication
     stdin_open: true
     tty: true
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_SHARED_URL=http://qdrant-shared:6333
       # Fallback Project ID if auto-detection fails
       - PROJECT_ROOT=/app
       - SHARP_IGNORE_GLOBAL_LIBVIPS=1
     depends_on:
       - qdrant
+      - qdrant-shared
     # Mount the current project so get_current_project_id works
     #volumes:
     # - .:/app:ro

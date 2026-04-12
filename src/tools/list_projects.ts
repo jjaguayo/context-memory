@@ -1,45 +1,45 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { qdrant } from "../lib/qdrant.js";
+import {McpServer} from "@modelcontextprotocol/sdk/server/mcp.js";
+import {qdrant} from "../lib/qdrant.js";
+import type {QdrantClient} from "@qdrant/js-client-rest";
 
-export function registerListProjectsTool(server: McpServer) {
+export function registerListProjectsTool(server: McpServer, sharedQdrant: QdrantClient | null = null) {
   server.tool(
     "list_projects",
-    {}, // No arguments needed
+    {},
     async () => {
       try {
-        // We use scroll to get points without a vector query
-        const response = await qdrant.scroll("memories", {
-          with_payload: ["projectId"], // Only fetch the projectId to save bandwidth
-          limit: 100, // Adjust if you have hundreds of projects
-        });
+        // Query both layers in parallel; shared failure degrades silently
+        const [personalResponse, sharedResponse] = await Promise.all([
+          qdrant.scroll("memories", {with_payload: ["projectId"], limit: 100}),
+          sharedQdrant
+            ? sharedQdrant.scroll("memories", {with_payload: ["projectId"], limit: 100}).catch(() => ({points: []}))
+            : Promise.resolve({points: []}),
+        ]);
 
-        // Extract unique project IDs using a Set
         const projectIds = new Set<string>();
-        response.points.forEach((point) => {
+        [...personalResponse.points, ...sharedResponse.points].forEach(point => {
           const id = point.payload?.projectId;
-          if (typeof id === "string") {
-            projectIds.add(id);
-          }
+          if (typeof id === "string") projectIds.add(id);
         });
 
-        const projectList = Array.from(projectIds);
+        const projectList = Array.from(projectIds).sort();
 
         if (projectList.length === 0) {
           return {
-            content: [{ type: "text", text: "No projects found in memory yet." }]
+            content: [{type: "text" as const, text: "No projects found in memory yet."}]
           };
         }
 
         return {
           content: [{
-            type: "text",
+            type: "text" as const,
             text: `Projects with existing memories:\n- ${projectList.join("\n- ")}`
           }]
         };
       } catch (error: any) {
         return {
           isError: true,
-          content: [{ type: "text", text: `Failed to list projects: ${error.message}` }]
+          content: [{type: "text" as const, text: `Failed to list projects: ${error.message}`}]
         };
       }
     }

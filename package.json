@@ -13,8 +13,8 @@
     "prepare": "git config core.hooksPath .githooks"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Jose John Aguayo",
+  "license": "MIT",
   "packageManager": "pnpm@10.11.0",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
