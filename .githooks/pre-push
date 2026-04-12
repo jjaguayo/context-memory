@@ -1,0 +1,18 @@
+#!/bin/sh
+# Pre-push hook: blocks pushes to main if tests fail.
+# Installed automatically via `pnpm install` (see "prepare" in package.json).
+
+while read local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = "refs/heads/main" ]; then
+    echo "[pre-push] Pushing to main — running test suite..."
+    pnpm test
+    if [ $? -ne 0 ]; then
+      echo "[pre-push] Tests failed. Push to main is blocked."
+      echo "[pre-push] Fix the failing tests and try again."
+      exit 1
+    fi
+    echo "[pre-push] All tests passed."
+  fi
+done
+
+exit 0

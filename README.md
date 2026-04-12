@@ -47,7 +47,7 @@ QDRANT_URL=http://localhost:6333 pnpm run start
 | Environment Variable | Default | Description |
 |---|---|---|
 | `QDRANT_URL` | `http://localhost:6333` | URL of the Qdrant instance |
-| `PROJECT_ROOT` | Current working directory | Used to derive the default project ID |
+| `PROJECT_ROOT` | Current working directory | Used to derive the default project ID and locate the team memory profile |
 
 ## Connecting to Claude Code
 
@@ -76,13 +76,14 @@ get_current_project_id()
 ```
 
 ### `remember_info`
-Stores a piece of text with optional tags, scoped to a project.
+Stores a piece of text with optional tags and category, scoped to a project. When a [team memory profile](#team-memory-profiles) is active, required tags and allowed categories are enforced.
 
 ```
 remember_info({
   text: "The payment service uses idempotency keys to prevent duplicate charges.",
   projectId: "my-project",
-  tags: ["payments", "architecture"]
+  tags: ["payments", "architecture"],
+  category: "Architecture Decisions"   // optional; validated against profile if one is active
 })
 ```
 
@@ -117,6 +118,65 @@ list_projects()
 → ["my-project", "other-project"]
 ```
 
+---
+
+## Team Memory Profiles
+
+Memory profiles let engineering teams define a shared standard for what goes into memory: required tags, allowed categories, and retention hints. The standard is version-controlled alongside the code and automatically applied to every `remember_info` call.
+
+### Setup
+
+Create `.context-memory/profile.yml` in your project root:
+
+```yaml
+version: 1
+name: "acme-eng-standard"
+
+# Every remember_info call must include these tags (case-sensitive).
+required_tags:
+  - service   # which service this memory relates to
+  - type      # architecture | decision | bug-fix | gotcha | preference
+
+# Allowed values for the optional `category` field.
+# If category is provided, it must match one of these exactly.
+memory_categories:
+  - Architecture Decisions
+  - API Contracts
+  - Known Gotchas
+  - Coding Preferences
+
+# Retention hints (not enforced yet — reserved for a future release).
+retention:
+  default_days: 90
+  per_category:
+    Architecture Decisions: 365
+    API Contracts: 180
+```
+
+The file should be committed to your repo so all team members inherit the standard automatically. The `.context-memory/` directory uses a scoped `.gitignore` that tracks only `profile.yml` — any runtime artifacts added in the future will not be committed.
+
+### How Enforcement Works
+
+When the server starts, it looks for `.context-memory/profile.yml` relative to `PROJECT_ROOT`. If the file is found:
+
+- **Required tags** — `remember_info` returns an error if any required tag is missing:
+  ```
+  Missing required tags: [type]. Profile: acme-eng-standard v1
+  ```
+
+- **Category validation** — if a `category` is provided and does not match `memory_categories`, `remember_info` returns an error:
+  ```
+  Invalid category 'Misc'. Allowed categories: [Architecture Decisions, API Contracts, Known Gotchas, Coding Preferences]. Profile: acme-eng-standard v1
+  ```
+
+- **Category is always optional** — omitting `category` is valid even when `memory_categories` is defined.
+
+### Backward Compatibility
+
+Projects without a `.context-memory/profile.yml` file behave exactly as before — there is no change in behavior and no configuration required for existing setups.
+
+---
+
 ## Development
 
 ```bash
@@ -140,8 +200,9 @@ Distance   : Cosine
 Payload fields:
   text      : string        — the stored content
   projectId : string        — project scope (indexed)
-  tags      : string[]      — optional keywords
+  tags      : string[]      — keywords for categorization
   timestamp : ISO 8601      — when the memory was created
+  category  : string?       — optional memory category (validated against profile if active)
 ```
 
 ## Tech Stack

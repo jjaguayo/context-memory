@@ -1,0 +1,5 @@
+# Ignore all runtime artifacts in this directory
+*
+# ...except the team memory profile
+!profile.yml
+!.gitignore

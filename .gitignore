@@ -1,6 +1,8 @@
 .claude/
 .idea/
 node_modules/
+dist/
+coverage/
 qdrant_data/
 qdrant_storage/
 pnpm-lock.yaml
