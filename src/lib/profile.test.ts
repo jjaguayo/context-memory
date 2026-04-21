@@ -87,6 +87,19 @@ auto_promote_tags:
     expect(profile!.retention?.per_category?.['Architecture Decisions']).toBe(365);
     expect(profile!.auto_promote_tags).toEqual(['architecture']);
   });
+
+  it('parses health_check_on_start when set to true', async () => {
+    await writeProfile('version: 1\nname: test\nhealth_check_on_start: true');
+    const profile = await loadProfile(testRoot);
+    expect(profile).not.toBeNull();
+    expect(profile!.health_check_on_start).toBe(true);
+  });
+
+  it('defaults health_check_on_start to false when absent', async () => {
+    await writeProfile('version: 1\nname: test');
+    const profile = await loadProfile(testRoot);
+    expect(profile!.health_check_on_start).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

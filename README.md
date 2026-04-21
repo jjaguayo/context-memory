@@ -1,34 +1,27 @@
 # context-memory
 
-An MCP (Model Context Protocol) server that gives AI agents persistent semantic memory across sessions. It stores, searches, and manages information using a local Qdrant vector database and WASM-based text embeddings — no external APIs required.
+**Team-grade long-term memory for AI agents — personal and shared.**
 
-Teams can optionally deploy a shared Qdrant instance so every developer's AI agent draws from the same pool of architectural decisions, API contracts, and known gotchas.
+Your AI coding agent forgets everything between sessions. context-memory fixes that. It gives agents a persistent, searchable memory layer backed by a local vector database — and when your team is ready, a shared layer so every developer's agent draws from the same pool of architectural decisions, API contracts, and hard-won gotchas.
 
-## How It Works
+Works as an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server with Claude Code, Cursor, and any MCP-compatible agent. No external APIs. No cloud dependencies. Fully self-hosted.
 
-When an AI agent calls `remember_info`, the text is converted into a 384-dimensional vector using the `all-MiniLM-L6-v2` model (runs locally via WASM) and stored in Qdrant. When the agent calls `search_memories`, the query is embedded the same way and a cosine similarity search finds the most relevant stored memories — even if the phrasing differs.
+---
 
-## Requirements
+## Quick Start
 
-- [Node.js](https://nodejs.org/) 20+
-- [pnpm](https://pnpm.io/) 10.11.0
-- [Docker](https://www.docker.com/) + Docker Compose (for the recommended setup)
+**Requirements:** Node.js 20+, pnpm 10.11.0, Docker + Docker Compose
 
-## Build
+### 1. Clone and build
 
 ```bash
-# Install dependencies (also installs the pre-push git hook)
+git clone https://github.com/joseaguayo/context-memory.git
+cd context-memory
 pnpm install
-
-# Compile TypeScript → dist/
 pnpm run build
 ```
 
-## Launch
-
-### Recommended: Docker Compose
-
-Starts the MCP server alongside both a personal and a shared Qdrant instance:
+### 2. Start the server
 
 ```bash
 docker-compose up
@@ -37,14 +30,44 @@ docker-compose up
 | Service | Port | Purpose |
 |---|---|---|
 | `qdrant` | 6333 | Personal vector database. Dashboard: http://localhost:6333/dashboard |
-| `qdrant-shared` | 6334 | Shared vector database (team layer). Dashboard: http://localhost:6334/dashboard |
-| `mcp-server` | — | MCP server connected to both Qdrant instances |
+| `qdrant-shared` | 6334 | Shared team database (optional). Dashboard: http://localhost:6334/dashboard |
+| `mcp-server` | — | MCP server, connected to both |
 
-Data is persisted in `./qdrant_storage/` (personal) and `./qdrant_storage_shared/` (shared).
+### 3. Connect to Claude Code
+
+```bash
+claude mcp add-json context-memory '{
+  "command": "docker",
+  "args": ["exec", "-i", "-e", "PROJECT_ROOT=$(pwd)", "context-memory-mcp-server", "node", "dist/index.js"]
+}'
+```
+
+Your agent can now store and search memories across sessions. See [Configuration](#configuration) for environment variables and [Local setup (without Docker)](#local-without-docker) for running without containers.
+
+---
+
+## How It Works
+
+When an agent calls `remember_info`, the text is converted into a 384-dimensional vector using `all-MiniLM-L6-v2` (runs locally via WASM — no GPU required) and stored in Qdrant. When the agent calls `search_memories`, the query is embedded the same way and a cosine similarity search returns the most relevant memories, even when the phrasing differs.
+
+Every memory stores provenance metadata alongside the content: who stored it (`author`), which session it came from (`session_id`), and when it was last confirmed as still valid (`last_confirmed`). The `memory_health` tool uses this to surface memories that have gone stale so teams can review them before they become noise.
+
+The server supports two layers: a **personal layer** (local Qdrant, always on) and an optional **shared layer** (team-deployed Qdrant, configured via `QDRANT_SHARED_URL`). Searches query both layers and return results interleaved by relevance.
+
+---
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `QDRANT_URL` | `http://localhost:6333` | Personal Qdrant instance |
+| `QDRANT_SHARED_URL` | _(unset)_ | Shared Qdrant instance. When set, enables the team memory layer. |
+| `PROJECT_ROOT` | Current working directory | Used to derive the project ID and locate `profile.yml` |
+| `GIT_AUTHOR_NAME` | _(unset)_ | Written to memory provenance. Falls back to `$USER`, then `"unknown"`. |
 
 ### Local (without Docker)
 
-Start Qdrant separately, then run the server with the relevant environment variables:
+Start Qdrant separately, then run:
 
 ```bash
 # Personal only
@@ -54,56 +77,58 @@ QDRANT_URL=http://localhost:6333 pnpm run start
 QDRANT_URL=http://localhost:6333 QDRANT_SHARED_URL=http://localhost:6334 pnpm run start
 ```
 
-## Configuration
-
-| Environment Variable | Default | Description |
-|---|---|---|
-| `QDRANT_URL` | `http://localhost:6333` | Personal Qdrant instance URL |
-| `QDRANT_SHARED_URL` | _(unset)_ | Shared Qdrant instance URL. When set, enables the team memory layer. |
-| `PROJECT_ROOT` | Current working directory | Used to derive the default project ID and locate the team memory profile |
-
-## Connecting to Claude Code
-
-Add the server to your Claude Code MCP configuration via `claude mcp add`:
-
-```bash
-claude mcp add-json docker-memory '{
-  "command": "docker",
-  "args": ["exec", "-i", "-e", "PROJECT_ROOT=$(pwd)", "context-memory-mcp-server", "node", "dist/index.js"]
-}'
-```
-
-Also consider adding instructions for how to use the tools in your agent's system prompt, referencing the tool names and expected inputs/outputs.
-The `CLAUDE.md` file in this repo provides an example of how to do this.
+---
 
 ## MCP Tools
 
-Once connected, the AI agent has access to six tools:
+Eight tools are available once the server is connected. The most-used tools are `remember_info`, `search_memories`, and `memory_health`. The full list:
+
+| Tool | What it does |
+|---|---|
+| `get_current_project_id` | Returns the active project ID (use this at session start) |
+| `remember_info` | Stores a memory with tags, category, and optional file hint |
+| `search_memories` | Semantic search across personal and shared memories |
+| `promote_memory` | Copies a personal memory to the shared team layer |
+| `confirm_memory` | Resets the staleness clock on a memory you've reviewed |
+| `memory_health` | Lists memories that are stale or aging, sorted by severity |
+| `forget_memory` | Deletes a memory or all memories for a project |
+| `list_projects` | Lists all projects with stored memories |
+
+---
 
 ### `get_current_project_id`
-Returns the current project identifier derived from `$PROJECT_ROOT` or the working directory name. Call this at the start of a session to scope memories to the right project.
+
+Call this at the start of every session to get the project ID for scoping memories correctly.
 
 ```
 get_current_project_id()
 → "my-project"
 ```
 
-### `remember_info`
-Stores a piece of text with optional tags and category, scoped to a project. When a [team memory profile](#team-memory-profiles) is active, required tags and allowed categories are enforced.
+---
 
-If the stored memory's tags match `auto_promote_tags` in the active profile and a shared layer is configured, the memory is automatically promoted to the shared layer.
+### `remember_info`
+
+Store anything worth keeping — architectural decisions, API quirks, debugging breakthroughs. The agent's identity and session are recorded automatically. Supply `source_file` when the memory is anchored to a specific file.
 
 ```
 remember_info({
   text: "The payment service uses idempotency keys to prevent duplicate charges.",
   projectId: "my-project",
   tags: ["payments", "architecture"],
-  category: "Architecture Decisions"   // optional; validated against profile if one is active
+  category: "Architecture Decisions",   // optional; validated against profile if one is active
+  source_file: "src/payments/service.ts" // optional; file this memory relates to
 })
+→ "✅ Successfully remembered for project \"my-project\": ..."
 ```
 
+When a [team profile](#team-memory-profiles) is active, `remember_info` enforces required tags and validates categories before storing. If a memory's tags match `auto_promote_tags` in the profile and a shared layer is configured, the memory is promoted automatically.
+
+---
+
 ### `search_memories`
-Performs a semantic similarity search across stored memories. When a shared layer is configured, results from both layers are merged and ranked by relevance. Each result is labelled with its source.
+
+Semantic search — finds relevant memories even when the phrasing differs from how they were stored. When a shared layer is configured, both layers are queried in parallel and results are interleaved by similarity score.
 
 ```
 search_memories({
@@ -117,33 +142,63 @@ search_memories({
 
 If the shared layer is unreachable, personal results are returned without error.
 
+---
+
 ### `promote_memory`
-Copies a personal memory to the shared layer so teammates can find it. The personal copy is kept.
+
+Move a personal memory into the shared team layer so teammates can find it. The personal copy is kept.
 
 ```
 promote_memory({ memoryId: "abc-123" })
 → "✅ Memory abc-123 promoted to shared layer (shared ID: xyz-789) for project \"my-project\"."
 ```
 
-Requires `QDRANT_SHARED_URL` to be configured.
+Requires `QDRANT_SHARED_URL` to be set.
+
+---
+
+### `confirm_memory`
+
+When `memory_health` flags a memory as stale, use this to reset its staleness clock after reviewing it. Only `last_confirmed` is updated — the content stays the same.
+
+```
+confirm_memory({ memoryId: "abc-123" })                    // personal layer (default)
+confirm_memory({ memoryId: "xyz-789", scope: "shared" })   // shared layer
+→ "✅ Memory abc-123 confirmed. Staleness clock reset."
+```
+
+---
+
+### `memory_health`
+
+Call this to review which memories have gone stale (past the threshold) or are aging (past 50% of the threshold). Results are sorted with the most stale first. Use `confirm_memory` to validate or `forget_memory` to remove.
+
+```
+memory_health({ projectId: "my-project" })                 // personal layer (default)
+memory_health({ projectId: "my-project", scope: "all" })   // both layers
+→ [STALE - 127 days] abc-123 [personal] (author: jsmith) "We use PostgreSQL for the payments service..."
+→ [AGING - 52 days]  def-456 [shared]   (author: mjones) "Auth service uses RS256 JWT tokens for all..."
+```
+
+Thresholds default to **90 days** and are configurable per category in `profile.yml`.
+
+---
 
 ### `forget_memory`
-Deletes a single memory by ID, or all memories for a project. Use the optional `scope` parameter to target a specific layer.
+
+Delete a single memory by ID or all memories for a project. Scope controls which layer is targeted.
 
 ```
-# Delete from personal layer (default)
-forget_memory({ memoryId: "abc-123" })
-forget_memory({ memoryId: "abc-123", scope: "personal" })
-
-# Delete from shared layer
-forget_memory({ memoryId: "xyz-789", scope: "shared" })
-
-# Delete from both layers
-forget_memory({ projectId: "my-project", scope: "all" })
+forget_memory({ memoryId: "abc-123" })                            // personal (default)
+forget_memory({ memoryId: "xyz-789", scope: "shared" })           // shared only
+forget_memory({ projectId: "my-project", scope: "all" })          // both layers
 ```
+
+---
 
 ### `list_projects`
-Lists all projects that have at least one stored memory. Queries both personal and shared layers and returns the deduplicated union.
+
+Lists every project with at least one stored memory, across both personal and shared layers.
 
 ```
 list_projects()
@@ -154,7 +209,7 @@ list_projects()
 
 ## Team Memory Profiles
 
-Memory profiles let engineering teams define a shared standard for what goes into memory: required tags, allowed categories, and retention hints. The standard is version-controlled alongside the code and automatically applied to every `remember_info` call.
+Memory profiles let your team define a shared standard for what goes into memory. One YAML file, committed to the repo — every agent on the team picks it up automatically.
 
 ### Setup
 
@@ -169,96 +224,121 @@ required_tags:
   - service   # which service this memory relates to
   - type      # architecture | decision | bug-fix | gotcha | preference
 
-# Allowed values for the optional `category` field.
-# If category is provided, it must match one of these exactly.
+# Allowed values for the `category` field.
+# A category is always optional — but if provided, it must match one of these.
 memory_categories:
   - Architecture Decisions
   - API Contracts
   - Known Gotchas
   - Coding Preferences
 
-# Memories tagged with any of these are automatically promoted to shared
-# when a shared layer is configured.
+# Tags that trigger automatic promotion to the shared layer.
 auto_promote_tags:
   - architecture
   - api-contract
 
-# Retention hints (not enforced yet — reserved for a future release).
+# Staleness thresholds for memory_health. Defaults to 90 days.
 retention:
   default_days: 90
   per_category:
     Architecture Decisions: 365
     API Contracts: 180
+
+# Run memory_health at startup and log the results to stderr.
+health_check_on_start: true
 ```
 
-The file should be committed to your repo so all team members inherit the standard automatically. The `.context-memory/` directory uses a scoped `.gitignore` that tracks only `profile.yml` — any runtime artifacts added in the future will not be committed.
+The `.context-memory/` directory uses a scoped `.gitignore` — `profile.yml` is tracked; any future runtime artifacts are not.
 
-### How Enforcement Works
+### What the profile enforces
 
-When the server starts, it looks for `.context-memory/profile.yml` relative to `PROJECT_ROOT`. If the file is found:
-
-- **Required tags** — `remember_info` returns an error if any required tag is missing:
+- **Required tags** — `remember_info` returns an actionable error listing exactly which tags are missing:
   ```
   Missing required tags: [type]. Profile: acme-eng-standard v1
   ```
 
-- **Category validation** — if a `category` is provided and does not match `memory_categories`, `remember_info` returns an error:
+- **Category validation** — if a `category` is provided that isn't in `memory_categories`:
   ```
-  Invalid category 'Misc'. Allowed categories: [Architecture Decisions, API Contracts, Known Gotchas, Coding Preferences]. Profile: acme-eng-standard v1
+  Invalid category 'Misc'. Allowed categories: [Architecture Decisions, API Contracts, ...]. Profile: acme-eng-standard v1
   ```
 
-- **Auto-promotion** — if a memory's tags intersect `auto_promote_tags` and `QDRANT_SHARED_URL` is configured, the memory is automatically promoted:
+- **Auto-promotion** — memories tagged with `auto_promote_tags` are promoted to shared automatically (when `QDRANT_SHARED_URL` is configured):
   ```
   ✅ Remembered for project "my-project" and auto-promoted to shared (tag: architecture): ...
   ```
 
-- **Category is always optional** — omitting `category` is valid even when `memory_categories` is defined.
+- **Startup health check** — when `health_check_on_start: true`, the server runs `memory_health` at startup and logs results to stderr so you see stale memories before the session begins.
 
-### Backward Compatibility
-
-Projects without a `.context-memory/profile.yml` file behave exactly as before. Projects without `QDRANT_SHARED_URL` set see no change from the shared layer features.
+**No profile? No change.** Projects without a `profile.yml` behave exactly as before.
 
 ---
 
 ## Team Setup
 
-### Solo Developer
-No additional configuration needed. Run as normal — everything uses the personal Qdrant instance.
+### Solo developer
+No extra configuration. Run as-is — everything uses your personal Qdrant instance.
 
-### Connecting a Team to a Shared Layer
+### Onboarding a team
 
-1. **Deploy a shared Qdrant instance** on your team's infrastructure (or use the local `docker-compose` setup for testing):
+1. **Deploy a shared Qdrant instance** on your team's infrastructure (or use the local `docker-compose` setup to test the setup first):
    ```bash
    docker-compose up qdrant-shared
    ```
 
-2. **Each team member sets `QDRANT_SHARED_URL`** pointing to the shared instance in their MCP server configuration.
+2. **Each team member sets `QDRANT_SHARED_URL`** in their MCP server config, pointing at the shared instance.
 
-3. **Team members can now:**
-   - Search shared memories automatically via `search_memories`
+3. **From that point, team members can:**
+   - Find shared knowledge in every `search_memories` call
    - Promote personal memories to shared via `promote_memory`
-   - Define `auto_promote_tags` in `profile.yml` for automatic promotion
+   - Use `auto_promote_tags` in `profile.yml` to skip the manual promote step
+   - Review and confirm shared memories via `memory_health` + `confirm_memory`
 
-4. **New team members** — configure `QDRANT_SHARED_URL` and immediately inherit the team's shared knowledge base.
+4. **New team member onboarding:** set `QDRANT_SHARED_URL` and immediately inherit everything the team has shared — no import, no sync, no manual setup.
+
+| User type | Config | Behaviour |
+|---|---|---|
+| Solo developer | `QDRANT_URL` only | Personal memories, full feature set, no change |
+| Team member | `QDRANT_URL` + `QDRANT_SHARED_URL` | Personal + shared search, promotion, health checks |
+| New team member | Same `QDRANT_SHARED_URL` as teammates | Inherits all shared team knowledge immediately |
+
+---
+
+## Contributing
+
+Contributions are welcome. context-memory is MIT-licensed and open source.
+
+The best places to start:
+
+- **Roadmap** — `PRODUCT_IDEAS.md` describes the next feature ideas and how they fit together. Each idea has a matching `IDEA_REQ.md` requirements document.
+- **Tests** — run `pnpm test` to verify your changes. The test suite uses [Vitest](https://vitest.dev/) and does not require a running Qdrant instance for unit tests.
+- **Pull requests** — open a PR against `main`. The pre-push hook runs the full test suite automatically before pushing.
+
+If you find a bug or have a feature idea, open an issue.
 
 ---
 
 ## Development
 
 ```bash
-# Watch mode (recompiles on file changes)
+# Install dependencies (also installs the pre-push git hook)
+pnpm install
+
+# Compile TypeScript → dist/
+pnpm run build
+
+# Watch mode — recompiles on file changes
 pnpm run dev
 
-# Run tests
+# Run tests (no Qdrant required)
 pnpm test
 
 # Run tests in watch mode
 pnpm test:watch
 ```
 
-The pre-push git hook (installed by `pnpm install` via the `prepare` script) runs the full test suite before any push to `main`.
+---
 
-## Vector Database Schema
+## Schema Reference
 
 ```
 Collection : memories
@@ -266,22 +346,35 @@ Vector size: 384 dimensions
 Distance   : Cosine
 
 Payload fields:
-  text      : string        — the stored content
-  projectId : string        — project scope (indexed)
-  tags      : string[]      — keywords for categorization
-  timestamp : ISO 8601      — when the memory was created
-  scope     : "personal" | "shared"  — which layer this memory lives in
-  category  : string?       — optional memory category (validated against profile if active)
+  text           : string              — the stored content
+  projectId      : string              — project scope (indexed)
+  tags           : string[]            — keywords for categorization
+  timestamp      : ISO 8601            — when the memory was created
+  scope          : "personal"|"shared" — which layer this memory lives in
+  category       : string?             — optional category (validated against profile if active)
+  author         : string              — $GIT_AUTHOR_NAME or $USER at store time; "unknown" if unset
+  session_id     : string              — UUID of the server session that stored this memory
+  last_confirmed : ISO 8601            — set at creation; updated by confirm_memory
+  source_file    : string?             — optional file path hint, agent-provided
+
+Derived (not stored):
+  confidence     : float [0,1]         — max(0, 1 - daysSince(last_confirmed) / threshold_days)
 ```
+
+---
 
 ## Tech Stack
 
 | Component | Technology |
 |---|---|
 | Protocol | Model Context Protocol (MCP) SDK |
-| Embeddings | `Xenova/all-MiniLM-L6-v2` via WASM (no GPU needed) |
+| Embeddings | `Xenova/all-MiniLM-L6-v2` via WASM (no GPU required) |
 | Vector DB | Qdrant |
 | Language | TypeScript (ESNext, strict mode) |
 | Runtime | Node.js 20 |
 | Package manager | pnpm |
 | Tests | Vitest |
+
+---
+
+MIT License — Copyright (c) 2026 Jose John Aguayo

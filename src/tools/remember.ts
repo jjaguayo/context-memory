@@ -9,7 +9,9 @@ import type {QdrantClient} from "@qdrant/js-client-rest";
 export function registerRememberTool(
   server: McpServer,
   profile: MemoryProfile | null = null,
-  sharedQdrant: QdrantClient | null = null
+  sharedQdrant: QdrantClient | null = null,
+  author: string = 'unknown',
+  sessionId: string = uuidv4()
 ) {
   server.tool(
     "remember_info",
@@ -17,9 +19,10 @@ export function registerRememberTool(
       text: z.string().describe("The information to remember"),
       projectId: z.string().describe("The name or ID of the current project"),
       tags: z.array(z.string()).optional().describe("Keywords for categorization. Required tags are enforced when a team profile is active."),
-      category: z.string().optional().describe("Memory category (e.g. 'Architecture Decisions'). Must match an allowed category when a team profile is active.")
+      category: z.string().optional().describe("Memory category (e.g. 'Architecture Decisions'). Must match an allowed category when a team profile is active."),
+      source_file: z.string().optional().describe("Optional file path hint — the source file this memory relates to (e.g. 'src/payments/service.ts')."),
     },
-    async ({text, projectId, tags, category}) => {
+    async ({text, projectId, tags, category, source_file}) => {
       try {
         // Enforce team profile rules before storing
         if (profile) {
@@ -37,7 +40,7 @@ export function registerRememberTool(
         const timestamp = new Date().toISOString();
         const storedTags = tags || [];
 
-        // Store in personal layer
+        // Store in personal layer with provenance fields
         await qdrant.upsert("memories", {
           wait: true,
           points: [{
@@ -49,7 +52,11 @@ export function registerRememberTool(
               tags: storedTags,
               timestamp,
               scope: "personal",
-              ...(category !== undefined && {category})
+              author,
+              session_id: sessionId,
+              last_confirmed: timestamp,
+              ...(category !== undefined && {category}),
+              ...(source_file !== undefined && {source_file}),
             }
           }]
         });
@@ -70,7 +77,11 @@ export function registerRememberTool(
                     tags: storedTags,
                     timestamp,
                     scope: "shared",
-                    ...(category !== undefined && {category})
+                    author,
+                    session_id: sessionId,
+                    last_confirmed: timestamp,
+                    ...(category !== undefined && {category}),
+                    ...(source_file !== undefined && {source_file}),
                   }
                 }]
               });

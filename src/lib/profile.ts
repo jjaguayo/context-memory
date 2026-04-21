@@ -15,6 +15,7 @@ export const MemoryProfileSchema = z.object({
   memory_categories: z.array(z.string()).optional().default([]),
   retention: RetentionSchema.optional(),
   auto_promote_tags: z.array(z.string()).optional().default([]),
+  health_check_on_start: z.boolean().optional().default(false),
 });
 
 export type MemoryProfile = z.infer<typeof MemoryProfileSchema>;

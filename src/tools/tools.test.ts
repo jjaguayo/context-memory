@@ -1,4 +1,5 @@
 import {describe, it, expect, vi, beforeEach, afterEach} from 'vitest';
+import {computeConfidence, getDaysSince, getHealthLabel, resolveThreshold} from '../lib/confidence.js';
 
 // vi.mock is hoisted — these run before any imports below
 vi.mock('../lib/qdrant.js', () => ({
@@ -26,6 +27,8 @@ import {registerForgetTool} from './forget.js';
 import {registerGetCurrent} from './get_current.js';
 import {registerListProjectsTool} from './list_projects.js';
 import {registerPromoteTool} from './promote.js';
+import {registerConfirmTool} from './confirm.js';
+import {registerHealthTool} from './health.js';
 import type {MemoryProfile} from '../lib/profile.js';
 
 // ---------------------------------------------------------------------------
@@ -861,5 +864,405 @@ describe('list_projects (shared layer)', () => {
     const result = await server.call('list_projects');
     expect(result.isError).toBeUndefined();
     expect(result.content[0]!.text).toContain('personal-only');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// confidence utilities (pure functions — no Qdrant dependency)
+// ---------------------------------------------------------------------------
+
+describe('confidence utilities', () => {
+  const FIXED_NOW = new Date('2026-04-20T00:00:00.000Z');
+
+  it('computeConfidence returns 1 for a brand-new memory', () => {
+    expect(computeConfidence(FIXED_NOW.toISOString(), 90, FIXED_NOW)).toBe(1);
+  });
+
+  it('computeConfidence returns 0.5 at exactly halfway to threshold', () => {
+    const fortyFiveDaysAgo = new Date(FIXED_NOW.getTime() - 45 * 24 * 60 * 60 * 1000).toISOString();
+    expect(computeConfidence(fortyFiveDaysAgo, 90, FIXED_NOW)).toBeCloseTo(0.5);
+  });
+
+  it('computeConfidence returns 0 at the threshold boundary', () => {
+    const ninetyDaysAgo = new Date(FIXED_NOW.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    expect(computeConfidence(ninetyDaysAgo, 90, FIXED_NOW)).toBe(0);
+  });
+
+  it('computeConfidence returns 0 (not negative) beyond the threshold', () => {
+    expect(computeConfidence('2020-01-01T00:00:00.000Z', 90, FIXED_NOW)).toBe(0);
+  });
+
+  it('getDaysSince returns correct whole-day count', () => {
+    const sixtyDaysAgo = new Date(FIXED_NOW.getTime() - 60 * 24 * 60 * 60 * 1000).toISOString();
+    expect(getDaysSince(sixtyDaysAgo, FIXED_NOW)).toBe(60);
+  });
+
+  it('getHealthLabel returns STALE for confidence 0', () => {
+    expect(getHealthLabel(0)).toBe('STALE');
+  });
+
+  it('getHealthLabel returns AGING for confidence between 0 and 0.5', () => {
+    expect(getHealthLabel(0.33)).toBe('AGING');
+    expect(getHealthLabel(0.49)).toBe('AGING');
+  });
+
+  it('resolveThreshold uses per_category when available', () => {
+    const profile: MemoryProfile = {
+      version: 1, name: 'test', required_tags: [], memory_categories: [], auto_promote_tags: [],
+      retention: {default_days: 90, per_category: {'Architecture Decisions': 365}},
+    };
+    expect(resolveThreshold('Architecture Decisions', profile)).toBe(365);
+  });
+
+  it('resolveThreshold falls back to default_days when category not in per_category', () => {
+    const profile: MemoryProfile = {
+      version: 1, name: 'test', required_tags: [], memory_categories: [], auto_promote_tags: [],
+      retention: {default_days: 180},
+    };
+    expect(resolveThreshold('Unknown Category', profile)).toBe(180);
+  });
+
+  it('resolveThreshold falls back to system default (90) when no profile', () => {
+    expect(resolveThreshold(undefined, null)).toBe(90);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// remember_info — provenance fields
+// ---------------------------------------------------------------------------
+
+describe('remember_info (provenance)', () => {
+  it('writes author, session_id, and last_confirmed to the payload', async () => {
+    const server = new MockServer();
+    registerRememberTool(server as any, null, null, 'test-author', 'test-session-id');
+
+    await server.call('remember_info', {text: 'x', projectId: 'p'});
+
+    const payload = (vi.mocked(qdrant.upsert).mock.calls[0]![1] as any).points[0].payload;
+    expect(payload.author).toBe('test-author');
+    expect(payload.session_id).toBe('test-session-id');
+    expect(typeof payload.last_confirmed).toBe('string');
+    // last_confirmed must be a valid ISO timestamp
+    expect(new Date(payload.last_confirmed).toISOString()).toBe(payload.last_confirmed);
+  });
+
+  it('writes source_file to the payload when provided', async () => {
+    const server = new MockServer();
+    registerRememberTool(server as any);
+
+    await server.call('remember_info', {text: 'x', projectId: 'p', source_file: 'src/payments.ts'});
+
+    const payload = (vi.mocked(qdrant.upsert).mock.calls[0]![1] as any).points[0].payload;
+    expect(payload.source_file).toBe('src/payments.ts');
+  });
+
+  it('does not write source_file key when source_file is omitted', async () => {
+    const server = new MockServer();
+    registerRememberTool(server as any);
+
+    await server.call('remember_info', {text: 'x', projectId: 'p'});
+
+    const payload = (vi.mocked(qdrant.upsert).mock.calls[0]![1] as any).points[0].payload;
+    expect(Object.keys(payload)).not.toContain('source_file');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// confirm_memory
+// ---------------------------------------------------------------------------
+
+describe('confirm_memory', () => {
+  it('returns isError when scope is "shared" and shared layer not configured', async () => {
+    const server = new MockServer();
+    registerConfirmTool(server as any, null);
+
+    const result = await server.call('confirm_memory', {memoryId: 'abc-123', scope: 'shared'});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/QDRANT_SHARED_URL/);
+    expect(vi.mocked(qdrant.retrieve)).not.toHaveBeenCalled();
+  });
+
+  it('returns isError when memory not found in personal layer', async () => {
+    vi.mocked(qdrant.retrieve).mockResolvedValueOnce([]);
+    const server = new MockServer();
+    registerConfirmTool(server as any, null);
+
+    const result = await server.call('confirm_memory', {memoryId: 'abc-123'});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/abc-123/);
+    expect(result.content[0]!.text).toMatch(/not found/);
+    expect(vi.mocked(qdrant.upsert)).not.toHaveBeenCalled();
+  });
+
+  it('updates only last_confirmed while preserving all other payload fields', async () => {
+    const originalPayload = {
+      text: 'Auth uses RS256',
+      projectId: 'my-project',
+      tags: ['auth'],
+      author: 'jsmith',
+      scope: 'personal',
+      last_confirmed: '2020-01-01T00:00:00.000Z',
+    };
+    vi.mocked(qdrant.retrieve).mockResolvedValueOnce([{
+      id: 'abc-123',
+      vector: new Array(384).fill(0.1),
+      payload: originalPayload,
+    }] as any);
+
+    const server = new MockServer();
+    registerConfirmTool(server as any, null);
+
+    const result = await server.call('confirm_memory', {memoryId: 'abc-123'});
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toMatch(/confirmed/);
+    expect(result.content[0]!.text).toMatch(/abc-123/);
+
+    const upsertCall = vi.mocked(qdrant.upsert).mock.calls[0]!;
+    const point = (upsertCall[1] as any).points[0];
+
+    // ID preserved
+    expect(point.id).toBe('abc-123');
+    // last_confirmed updated to a recent timestamp
+    expect(point.payload.last_confirmed).not.toBe('2020-01-01T00:00:00.000Z');
+    expect(new Date(point.payload.last_confirmed).toISOString()).toBe(point.payload.last_confirmed);
+    // Other fields preserved
+    expect(point.payload.text).toBe('Auth uses RS256');
+    expect(point.payload.author).toBe('jsmith');
+    expect(point.payload.projectId).toBe('my-project');
+    expect(point.payload.scope).toBe('personal');
+  });
+
+  it('uses the shared layer when scope is "shared"', async () => {
+    const mockShared = makeMockSharedQdrant();
+    mockShared.retrieve.mockResolvedValueOnce([{
+      id: 'abc-123',
+      vector: new Array(384).fill(0.1),
+      payload: {text: 'x', projectId: 'p', last_confirmed: '2020-01-01T00:00:00.000Z'},
+    }] as any);
+
+    const server = new MockServer();
+    registerConfirmTool(server as any, mockShared as any);
+
+    const result = await server.call('confirm_memory', {memoryId: 'abc-123', scope: 'shared'});
+
+    expect(result.isError).toBeUndefined();
+    expect(mockShared.retrieve).toHaveBeenCalledOnce();
+    expect(mockShared.upsert).toHaveBeenCalledOnce();
+    // Personal layer must NOT be touched
+    expect(vi.mocked(qdrant.retrieve)).not.toHaveBeenCalled();
+    expect(vi.mocked(qdrant.upsert)).not.toHaveBeenCalled();
+  });
+
+  it('returns isError when the Qdrant retrieve throws', async () => {
+    vi.mocked(qdrant.retrieve).mockRejectedValueOnce(new Error('retrieve failed'));
+    const server = new MockServer();
+    registerConfirmTool(server as any, null);
+
+    const result = await server.call('confirm_memory', {memoryId: 'abc-123'});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/retrieve failed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// memory_health
+// ---------------------------------------------------------------------------
+
+describe('memory_health', () => {
+  const STALE_DATE = '2020-01-01T00:00:00.000Z';
+  const agingDate = () => new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+  const freshDate = () => new Date().toISOString();
+
+  it('returns "all healthy" when no memories are stale or aging', async () => {
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [{id: 'fresh-1', payload: {projectId: 'p', text: 'Fresh memory', last_confirmed: freshDate()}}],
+    } as any);
+
+    const server = new MockServer();
+    registerHealthTool(server as any);
+
+    const result = await server.call('memory_health', {projectId: 'p'});
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toMatch(/All memories.*healthy/);
+  });
+
+  it('returns STALE for a memory past the threshold', async () => {
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [{
+        id: 'stale-1',
+        payload: {projectId: 'p', text: 'We use PostgreSQL for payments', author: 'jsmith', last_confirmed: STALE_DATE},
+      }],
+    } as any);
+
+    const server = new MockServer();
+    registerHealthTool(server as any);
+
+    const result = await server.call('memory_health', {projectId: 'p'});
+
+    expect(result.content[0]!.text).toMatch(/STALE/);
+    expect(result.content[0]!.text).toMatch(/stale-1/);
+    expect(result.content[0]!.text).toMatch(/jsmith/);
+    expect(result.content[0]!.text).toMatch(/We use PostgreSQL/);
+  });
+
+  it('returns AGING for a memory past 50% of the threshold', async () => {
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [{
+        id: 'aging-1',
+        payload: {projectId: 'p', text: 'Auth uses RS256', author: 'mjones', last_confirmed: agingDate()},
+      }],
+    } as any);
+
+    const server = new MockServer();
+    registerHealthTool(server as any);
+
+    const result = await server.call('memory_health', {projectId: 'p'});
+
+    expect(result.content[0]!.text).toMatch(/AGING/);
+    expect(result.content[0]!.text).toMatch(/aging-1/);
+  });
+
+  it('sorts results with most stale (lowest confidence) first', async () => {
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [
+        {id: 'aging-1', payload: {projectId: 'p', text: 'Aging memory', last_confirmed: agingDate()}},
+        {id: 'stale-1', payload: {projectId: 'p', text: 'Stale memory', last_confirmed: STALE_DATE}},
+      ],
+    } as any);
+
+    const server = new MockServer();
+    registerHealthTool(server as any);
+
+    const result = await server.call('memory_health', {projectId: 'p'});
+    const text = result.content[0]!.text;
+
+    // STALE (confidence = 0) must appear before AGING (confidence ~0.33)
+    expect(text.indexOf('stale-1')).toBeLessThan(text.indexOf('aging-1'));
+  });
+
+  it('uses per-category threshold from profile (memory healthy under long threshold)', async () => {
+    const profile: MemoryProfile = {
+      version: 1, name: 'test', required_tags: [], memory_categories: ['Architecture Decisions'],
+      auto_promote_tags: [],
+      retention: {default_days: 90, per_category: {'Architecture Decisions': 365}},
+    };
+    // 100 days ago — STALE under 90-day default, but healthy under 365-day category threshold
+    const hundredDaysAgo = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000).toISOString();
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [{
+        id: 'arch-1',
+        payload: {projectId: 'p', text: 'Architecture decision', category: 'Architecture Decisions', last_confirmed: hundredDaysAgo},
+      }],
+    } as any);
+
+    const server = new MockServer();
+    registerHealthTool(server as any, null, profile);
+
+    const result = await server.call('memory_health', {projectId: 'p'});
+
+    expect(result.content[0]!.text).toMatch(/All memories.*healthy/);
+  });
+
+  it('queries both layers when scope is "all"', async () => {
+    const mockShared = makeMockSharedQdrant();
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({points: []} as any);
+    mockShared.scroll.mockResolvedValueOnce({points: []} as any);
+
+    const server = new MockServer();
+    registerHealthTool(server as any, mockShared as any);
+
+    await server.call('memory_health', {projectId: 'p', scope: 'all'});
+
+    expect(vi.mocked(qdrant.scroll)).toHaveBeenCalledOnce();
+    expect(mockShared.scroll).toHaveBeenCalledOnce();
+  });
+
+  it('returns isError when scope is "shared" and shared layer not configured', async () => {
+    const server = new MockServer();
+    registerHealthTool(server as any, null);
+
+    const result = await server.call('memory_health', {projectId: 'p', scope: 'shared'});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/QDRANT_SHARED_URL/);
+  });
+
+  it('returns isError when scope is "all" and shared layer not configured', async () => {
+    const server = new MockServer();
+    registerHealthTool(server as any, null);
+
+    const result = await server.call('memory_health', {projectId: 'p', scope: 'all'});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/QDRANT_SHARED_URL/);
+  });
+
+  it('returns personal results with warning when shared fails and scope is "all"', async () => {
+    const mockShared = makeMockSharedQdrant();
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({points: []} as any);
+    mockShared.scroll.mockRejectedValueOnce(new Error('shared layer down'));
+
+    const server = new MockServer();
+    registerHealthTool(server as any, mockShared as any);
+
+    const result = await server.call('memory_health', {projectId: 'p', scope: 'all'});
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toMatch(/shared layer down/);
+  });
+
+  it('falls back to timestamp field when last_confirmed is absent', async () => {
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [{
+        id: 'legacy-1',
+        payload: {projectId: 'p', text: 'Legacy memory without provenance', timestamp: STALE_DATE},
+      }],
+    } as any);
+
+    const server = new MockServer();
+    registerHealthTool(server as any);
+
+    const result = await server.call('memory_health', {projectId: 'p'});
+
+    expect(result.content[0]!.text).toMatch(/STALE/);
+    expect(result.content[0]!.text).toMatch(/legacy-1/);
+  });
+
+  it('treats memory as healthy when both last_confirmed and timestamp are absent', async () => {
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [{
+        id: 'no-date-1',
+        payload: {projectId: 'p', text: 'Memory with no date fields'},
+      }],
+    } as any);
+
+    const server = new MockServer();
+    registerHealthTool(server as any);
+
+    const result = await server.call('memory_health', {projectId: 'p'});
+
+    expect(result.content[0]!.text).toMatch(/All memories.*healthy/);
+  });
+
+  it('truncates long text previews to 80 characters', async () => {
+    const longText = 'A'.repeat(120);
+    vi.mocked(qdrant.scroll).mockResolvedValueOnce({
+      points: [{id: 'long-1', payload: {projectId: 'p', text: longText, last_confirmed: STALE_DATE}}],
+    } as any);
+
+    const server = new MockServer();
+    registerHealthTool(server as any);
+
+    const result = await server.call('memory_health', {projectId: 'p'});
+    const text = result.content[0]!.text;
+
+    // Preview must be at most 80 chars + "..."
+    expect(text).toContain('A'.repeat(80) + '...');
+    expect(text).not.toContain('A'.repeat(81) + 'A');
   });
 });

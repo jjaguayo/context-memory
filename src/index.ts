@@ -1,5 +1,7 @@
 import {McpServer} from "@modelcontextprotocol/sdk/server/mcp.js";
 import {StdioServerTransport} from "@modelcontextprotocol/sdk/server/stdio.js";
+import {basename} from "path";
+import {v4 as uuidv4} from 'uuid';
 import {ensureCollection, ensureSharedCollection, sharedQdrant} from "./lib/qdrant.js";
 import {loadProfile} from "./lib/profile.js";
 import {registerSearchTool} from "./tools/search.js";
@@ -8,6 +10,8 @@ import {registerForgetTool} from "./tools/forget.js";
 import {registerGetCurrent} from "./tools/get_current.js";
 import {registerListProjectsTool} from "./tools/list_projects.js";
 import {registerPromoteTool} from "./tools/promote.js";
+import {registerConfirmTool} from "./tools/confirm.js";
+import {registerHealthTool, runHealthCheck} from "./tools/health.js";
 
 const server = new McpServer({
   name: "local-memory-layer",
@@ -33,15 +37,37 @@ async function main() {
       console.error(`[profile] Loaded profile "${profile.name}" v${profile.version}`);
     }
 
-    // 4. Register tools
+    // 4. Resolve provenance fields once at startup
+    const sessionId = uuidv4();
+    const author = process.env.GIT_AUTHOR_NAME ?? process.env.USER ?? 'unknown';
+
+    // 5. Register tools
     registerSearchTool(server, sharedQdrant);
-    registerRememberTool(server, profile, sharedQdrant);
+    registerRememberTool(server, profile, sharedQdrant, author, sessionId);
     registerForgetTool(server, sharedQdrant);
     registerGetCurrent(server);
     registerListProjectsTool(server, sharedQdrant);
     registerPromoteTool(server, sharedQdrant);
+    registerConfirmTool(server, sharedQdrant);
+    registerHealthTool(server, sharedQdrant, profile);
 
-    // 5. Connect using Standard Input/Output (Stdio)
+    // 6. Startup health check (if enabled in profile)
+    if (profile?.health_check_on_start) {
+      try {
+        const projectId = basename(projectRoot);
+        const checkScope = sharedQdrant ? 'all' : 'personal';
+        const healthText = await runHealthCheck(projectId, checkScope, sharedQdrant, profile, sharedQdrant !== null);
+        if (healthText.startsWith('✅')) {
+          console.error(`[health] ${healthText}`);
+        } else {
+          console.error(`[health] Memories need review for project "${projectId}":\n${healthText}`);
+        }
+      } catch (err: any) {
+        console.error(`[health] Startup health check failed: ${err.message}`);
+      }
+    }
+
+    // 7. Connect using Standard Input/Output (Stdio)
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
